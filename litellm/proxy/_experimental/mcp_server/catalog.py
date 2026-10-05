@@ -7,10 +7,10 @@ import base64
 import hashlib
 import json
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from functools import wraps
+from functools import partial, wraps
 from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, ParamSpec, TypeVar
@@ -731,6 +731,7 @@ async def get_filtered_server_tools(
     prefetched_oauth_creds: Mapping[str, OAuthCredentialPayload],
     params: PaginatedRequestParams | None = None,
     record_listing: bool = False,
+    listing_updates: ExitStack | None = None,
 ) -> tuple[ListToolsResult, ServerOutcome]:
     from mcp.types import ListToolsResult
 
@@ -848,7 +849,8 @@ async def get_filtered_server_tools(
         from litellm.proxy._experimental.mcp_server.mcp_server_manager import ListedToolsCaller
         from litellm.proxy._experimental.mcp_server.utils import strip_known_server_prefix
 
-        global_mcp_server_manager.record_listed_tools(
+        record: Final = partial(
+            global_mcp_server_manager.record_listed_tools,
             server,
             [tool.model_copy(update={"name": strip_known_server_prefix(tool.name, server)}) for tool in filtered_tools],
             ListedToolsCaller(
@@ -861,6 +863,10 @@ async def get_filtered_server_tools(
             record_listing=record_listing,
             continuation=params is not None and params.cursor is not None,
         )
+        if listing_updates is None:
+            record()
+        else:
+            listing_updates.callback(record)
 
         if mcp_proxy_mode:
             from litellm.proxy._experimental.mcp_server.tool_search import with_mcp_proxy_identity
@@ -938,6 +944,7 @@ async def aggregate_gateway_tools(
 
     async with global_mcp_server_manager.catalog.operation() as snapshot:
         servers: Final = {server.server_id: server for server in allowed}
+        listing_updates: Final = ExitStack()
 
         async def fetch(server_id: str, cursor: str | None) -> ListToolsResult:
             result, outcome = await get_filtered_server_tools(
@@ -947,6 +954,7 @@ async def aggregate_gateway_tools(
                 prefetched_oauth_creds=prefetched,
                 params=PaginatedRequestParams(cursor=cursor),
                 record_listing=record_listing,
+                listing_updates=listing_updates,
             )
             if cursor is not None and outcome.tag != "ok":
                 from mcp.shared.exceptions import MCPError
@@ -972,6 +980,7 @@ async def aggregate_gateway_tools(
             fetch=fetch,
             now=int(time.time()),
         )
+        listing_updates.close()
         return AggregateToolListing(
             tools=result.tools,
             outcomes=TypeAdapter(dict[str, ServerOutcome]).validate_python(
