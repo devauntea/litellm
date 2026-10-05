@@ -399,6 +399,7 @@ from litellm.proxy.common_request_processing import (
     ProxyBaseLLMRequestProcessing,
     _is_azure_model_router_request,
     _should_return_raw_model_name,
+    close_guarded_stream,
     create_response,
     log_llm_api_exception,
     open_sse_before_first_byte,
@@ -1602,11 +1603,6 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[ProxyLifespanState
         )
         if not model_info_scheduler.running:
             model_info_scheduler.start()
-
-    if scheduler is not None and prisma_client is not None:
-        from litellm.proxy.management_endpoints.roi_calculator_endpoints import register_scheduled_sync
-
-        register_scheduled_sync(scheduler)
 
     tracing_settings: Final = cast(  # cast-ok: Pydantic validates the legacy untyped settings value
         dict[str, object] | None,
@@ -8165,6 +8161,8 @@ class ProxyConfig:
         self,
         prisma_client: PrismaClient,
         proxy_logging_obj: ProxyLogging,
+        *,
+        ui_settings_already_synced: bool = False,
     ) -> ReconcileOutcome:
         """
         - Check db for new models
@@ -8187,7 +8185,8 @@ class ProxyConfig:
         Also re-reads the UI settings that back runtime flags. That runs before the lock, so a
         setting written through one pod reaches the others without waiting on a model reconcile.
         """
-        await sync_ui_settings_to_general_settings(prisma_client)
+        if not ui_settings_already_synced:
+            await sync_ui_settings_to_general_settings(prisma_client)
 
         async with MODEL_RECONCILE_LOCK:
             return await self._add_deployment_locked(prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj)
@@ -9911,6 +9910,17 @@ async def async_data_generator(
     stream_completed = False
     client_disconnected = False
     error_state: Final = ResponsesStreamErrorState() if responses_stream_errors else None
+    needs_iterator_wrap: Final = proxy_logging_obj.needs_iterator_wrap()
+    stream_iterator: Final[AsyncIterator[object]] = (
+        proxy_logging_obj.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=user_api_key_dict,
+            response=response,
+            request_data=request_data,
+        )
+        if needs_iterator_wrap
+        else response
+    )
+    stream_source: AsyncIterator[object] | None = None  # rebind-ok: bound once the keepalive policy resolves
     try:
         error_message: str | None = None
         requested_model_from_client: Final = _get_client_requested_model_for_streaming(request_data=request_data)
@@ -9935,20 +9945,10 @@ async def async_data_generator(
         # per-chunk hook. Coalescing them into a single flag forced wasted
         # ``get_response_string`` work per chunk on every deployment that
         # happened to ship a streaming-iterator override (the default).
-        needs_iterator_wrap: Final = proxy_logging_obj.needs_iterator_wrap()
         needs_per_chunk_hook: Final = proxy_logging_obj.needs_per_chunk_streaming_hook()
         is_raw_sse_stream: Final = bool(request_data.get("_litellm_raw_sse_stream"))
         strip_stream_usage: Final = bool(request_data.get("_litellm_strip_stream_usage"))
         raw_sse_buffer = ""
-
-        if needs_iterator_wrap:
-            stream_iterator = proxy_logging_obj.async_post_call_streaming_iterator_hook(
-                user_api_key_dict=user_api_key_dict,
-                response=response,
-                request_data=request_data,
-            )
-        else:
-            stream_iterator = response
 
         # A stream can start on a deployment with keepalive off and fall back
         # mid-stream to one that enables it: only skip wrapping altogether when
@@ -9958,7 +9958,7 @@ async def async_data_generator(
         # happens to start with it off.
         resolve_keepalive_seconds: Final = _make_keepalive_resolver(request_data)
         initial_keepalive_seconds: Final = resolve_keepalive_seconds(response)
-        stream_source: Final = (
+        stream_source = (
             _iter_with_keepalive(
                 stream_iterator.__aiter__(),
                 resolve_keepalive_seconds,
@@ -10099,6 +10099,9 @@ async def async_data_generator(
         # (a nested iterator hook would only see GeneratorExit on GC).
         if not stream_completed:
             client_disconnected = True
+        for guarded_layer in (stream_source, stream_iterator):
+            if guarded_layer is not response:
+                await close_guarded_stream(guarded_layer)
         raise
     except Exception as e:
         verbose_proxy_logger.exception("litellm.proxy.proxy_server.async_data_generator(): Exception occured - %s", e)

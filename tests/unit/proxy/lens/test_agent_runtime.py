@@ -1,9 +1,19 @@
+import asyncio
 from queue import SimpleQueue
 from typing import Final
 
 import pytest
 
-from litellm.proxy.lens.agent_runtime import AgentTurn, JournalReply, PythonAgentTurn, run_agent
+from litellm.proxy.lens.agent_runtime import (
+    AgentTurn,
+    DialogueTurn,
+    InitialContext,
+    JournalReply,
+    PythonAgentTurn,
+    history_reply,
+    parallel_tools,
+    run_agent,
+)
 from litellm.proxy.lens.agent_workspace import (
     EvidenceReply,
     EvidenceRequest,
@@ -11,7 +21,7 @@ from litellm.proxy.lens.agent_workspace import (
     PythonRequest,
     SessionContent,
 )
-from litellm.proxy.lens.analysis import Extraction, Observation
+from litellm.proxy.lens.analysis import AnalysisResponseError, Extraction, Observation
 from litellm.proxy.lens.models import Claim, Evidence, ModelMessage, ModelRequest, ModelResult, Record, TracePart
 from litellm.proxy.lens.state import queue_job
 from tests.unit.proxy.lens.test_agent_workspace import execution
@@ -30,6 +40,13 @@ class ToolReply(Record):
 
 class CheckpointPrompt(Record):
     working_notes: str
+
+
+class CompactedPrompt(CheckpointPrompt):
+    journal_turns: int
+    resume_history_from_turn: int
+    initial_context_archived: bool
+    continuation: str
 
 
 class PythonError(Record):
@@ -188,6 +205,161 @@ async def test_disabled_python_rejects_python_call_before_execution_and_omits_py
         schema=Extraction,
     )
     assert result == Extraction()
+
+
+@pytest.mark.asyncio
+async def test_automatic_compaction_recovers_oversized_tool_output_and_preserves_findings() -> None:
+    from litellm.proxy.lens.agent_context import Checkpoint
+
+    sentinel: Final = "exact original evidence"
+    part: Final = TracePart(
+        execution_id="one",
+        span_id="nested",
+        parent_span_id="root",
+        name="child",
+        kind="tool",
+        content=("large recorded result " * 2000) + sentinel,
+    )
+    expected: Final = Extraction(
+        observations=(
+            Observation(
+                check_id="retries",
+                summary="Nested tool failure",
+                evidence=(Evidence(execution_id="one", span_id="nested", quote=sentinel),),
+            ),
+        )
+    )
+    turns: Final = iter(range(7))
+    full_reply: Final = SimpleQueue[str]()
+
+    async def model(request: ModelRequest) -> ModelResult:
+        turn: Final = next(turns)
+        if turn == 0:
+            return ModelResult(
+                content=AgentTurn[Extraction](tools=(EvidenceRequest(action="read"),)).model_dump_json(), cost=0
+            )
+        if turn == 1:
+            oversized: Final = ToolReply.model_validate_json(request.messages[-1].content)
+            full_reply.put(oversized.tool_results[0])
+            assert sentinel in oversized.tool_results[0]
+            return ModelResult(content="", cost=0, context_exceeded=True)
+        if turn == 2:
+            assert "Compact this analysis conversation" in request.messages[-1].content
+            assert sentinel in request.messages[-2].content
+            return ModelResult(content="", cost=0, context_exceeded=True)
+        if turn == 3:
+            assert all(sentinel not in message.content for message in request.messages)
+            return ModelResult(
+                content=Checkpoint(working_notes="Inspect the nested tool in session one").model_dump_json(), cost=0
+            )
+        if turn == 4:
+            context: Final = CompactedPrompt.model_validate_json(request.messages[1].content)
+            assert context.resume_history_from_turn == 0
+            assert context.journal_turns == 2
+            return ModelResult(
+                content=AgentTurn[Extraction](
+                    tools=(EvidenceRequest(action="history", turn_end=1, char_start=0, char_end=600),)
+                ).model_dump_json(),
+                cost=0,
+            )
+        if turn == 5:
+            retrieved: Final = ToolReply.model_validate_json(request.messages[-1].content)
+            history: Final = JournalReply.model_validate_json(retrieved.tool_results[0])
+            assert history.excerpt is not None and len(history.excerpt) == 600
+            assert history.characters > len(full_reply.get_nowait())
+            assert history.total_turns == 2
+            return ModelResult(
+                content=AgentTurn[Extraction](
+                    tools=(
+                        EvidenceRequest(
+                            action="read",
+                            execution_id="one",
+                            span_ids=("nested",),
+                            char_start=len(part.content) - len(sentinel),
+                        ),
+                    )
+                ).model_dump_json(),
+                cost=0,
+            )
+        reply: Final = ToolReply.model_validate_json(request.messages[-1].content)
+        assert EvidenceReply.model_validate_json(reply.tool_results[0]).parts[0].content == sentinel
+        return ModelResult(content=AgentTurn[Extraction](result=expected).model_dump_json(), cost=0)
+
+    result: Final = await run_agent(
+        stage="review",
+        task="Review",
+        purpose="extract",
+        claim=Claim(lens_id="lens", job=queue_job(lens(), NOW, "job").jobs[0], findings=()),
+        workspace=EvidenceWorkspace(
+            sessions=(SessionContent(execution=execution("one"), parts=(part,), partial=False),)
+        ),
+        model=model,
+        schema=Extraction,
+    )
+    assert result == expected
+
+
+def test_history_ranges_reconstruct_one_oversized_result_without_gaps() -> None:
+    journal: Final = (DialogueTurn(response="read original", tool_results=("complete result " * 200,)),)
+    initial: Final = InitialContext(evidence=(), supplied="original assignment")
+    whole: Final = history_reply(EvidenceRequest(action="history", include_initial=True), initial, journal)
+    serialized: Final = whole.model_dump_json()
+    pieces: Final = tuple(
+        history_reply(
+            EvidenceRequest(action="history", include_initial=True, char_start=start, char_end=start + 97),
+            initial,
+            journal,
+        )
+        for start in range(0, len(serialized), 97)
+    )
+    assert "".join(piece.excerpt or "" for piece in pieces) == serialized
+    assert all(piece.characters == len(serialized) for piece in pieces)
+    catalog: Final = history_reply(EvidenceRequest(action="history", turn_end=0), initial, journal)
+    assert catalog.turns == ()
+    assert catalog.turn_characters == (len(journal[0].model_dump_json()),)
+
+
+@pytest.mark.asyncio
+async def test_unfit_task_fails_without_an_endless_compaction_loop() -> None:
+    calls: Final = SimpleQueue[ModelRequest]()
+
+    async def model(request: ModelRequest) -> ModelResult:
+        calls.put(request)
+        assert calls.qsize() < 5
+        return ModelResult(content="", cost=0, context_exceeded=True)
+
+    with pytest.raises(AnalysisResponseError, match="task alone cannot fit"):
+        await run_agent(
+            stage="review",
+            task="Review",
+            purpose="extract",
+            claim=Claim(lens_id="lens", job=queue_job(lens(), NOW, "job").jobs[0], findings=()),
+            workspace=EvidenceWorkspace(),
+            model=model,
+            schema=Extraction,
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_parallel_tool_cancels_and_reaps_its_running_sibling() -> None:
+    started: Final = asyncio.Event()
+    stopped: Final = asyncio.Event()
+
+    async def running() -> str:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+        return "unreachable"
+
+    async def failed() -> str:
+        await started.wait()
+        raise ValueError("worker lease revoked")
+
+    with pytest.raises(ValueError, match="lease revoked"):
+        await parallel_tools((running(), failed()))
+    assert stopped.is_set()
 
 
 @pytest.mark.asyncio

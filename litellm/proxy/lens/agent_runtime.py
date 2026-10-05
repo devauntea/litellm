@@ -1,13 +1,15 @@
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from types import MappingProxyType
 from typing import Final, Generic, Literal, TypeVar
 
 from pydantic import Field
 
+from .activity import ActivityTracker, observe_operation, observed_model
+from .agent_context import compact_context
 from .agent_workspace import EvidenceRequest, EvidenceWorkspace, PythonRequest
-from .analysis import ModelCall, structured_response_with_history
+from .analysis import AnalysisContextExceeded, AnalysisResponseError, ModelCall, structured_response_with_history
 from .models import Claim, ModelMessage, ModelRequest, Record, TracePart
 from .python_tool import execute_python
 
@@ -41,6 +43,9 @@ class JournalReply(Record):
     total_turns: int
     initial_context: InitialContext | None = None
     turns: tuple[DialogueTurn, ...] = ()
+    turn_characters: tuple[int, ...] = ()
+    excerpt: str | None = None
+    characters: int = 0
     error: str = ""
 
 
@@ -53,6 +58,8 @@ class JournalReference(Record):
 def archived_result(request: EvidenceRequest | PythonRequest, result: str, journal_size: int) -> str:
     if request.action != "history":
         return result
+    if request.char_start or request.char_end is not None:
+        return result
     if request.turn_start > journal_size or (request.turn_end is not None and request.turn_end < request.turn_start):
         return result
     end: Final = min(request.turn_end, journal_size) if request.turn_end is not None else journal_size
@@ -64,12 +71,35 @@ def archived_result(request: EvidenceRequest | PythonRequest, result: str, journ
 def history_reply(request: EvidenceRequest, initial: InitialContext, journal: tuple[DialogueTurn, ...]) -> JournalReply:
     if request.turn_start > len(journal) or (request.turn_end is not None and request.turn_end < request.turn_start):
         return JournalReply(request=request, total_turns=len(journal), error="Choose a valid journal turn range.")
-    return JournalReply(
-        request=request,
+    if request.char_end is not None and request.char_end < request.char_start:
+        return JournalReply(request=request, total_turns=len(journal), error="Choose a valid character range.")
+    reply: Final = JournalReply(
+        request=request.model_copy(update=MappingProxyType({"char_start": 0, "char_end": None})),
         total_turns=len(journal),
         initial_context=initial if request.include_initial else None,
         turns=journal[request.turn_start : request.turn_end],
+        turn_characters=tuple(len(turn.model_dump_json()) for turn in journal),
     )
+    if not request.char_start and request.char_end is None:
+        return reply
+    serialized: Final = reply.model_dump_json()
+    return JournalReply(
+        request=request,
+        total_turns=len(journal),
+        excerpt=serialized[request.char_start : request.char_end],
+        characters=len(serialized),
+    )
+
+
+async def parallel_tools(calls: tuple[Awaitable[str], ...]) -> tuple[str, ...]:
+    tasks: Final = tuple(asyncio.ensure_future(call) for call in calls)
+    try:
+        return tuple(await asyncio.gather(*tasks))
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def run_agent(
@@ -85,6 +115,7 @@ async def run_agent(
     supplied: str = "",
     validate: Callable[[ResponseT], str | None] = lambda _: None,
     enable_python: bool = False,
+    activity: ActivityTracker | None = None,
 ) -> ResponseT:
     initial: Final = InitialContext(evidence=initial_evidence, supplied=supplied)
     journal: tuple[DialogueTurn, ...] = ()  # rebind-ok: preserve every turn even when active context is replaced
@@ -95,7 +126,7 @@ async def run_agent(
             return "Return tools and/or a checkpoint with result=null, or a final result without tools or checkpoint."
         return validate(turn.result) if turn.result is not None else None
 
-    async def respond(request: EvidenceRequest | PythonRequest) -> str:
+    async def tool_result(request: EvidenceRequest | PythonRequest) -> str:
         if isinstance(request, PythonRequest):
             data: Final = workspace.python_data(request)
             if isinstance(data, str):
@@ -106,6 +137,11 @@ async def run_agent(
             return history_reply(request, initial, journal).model_dump_json()
         return workspace.respond(request).model_dump_json()
 
+    async def respond(request: EvidenceRequest | PythonRequest) -> str:
+        async with observe_operation(activity, request.action):
+            return await tool_result(request)
+
+    call: Final = observed_model(model, activity)
     prompt: Final = json.dumps(
         {
             "stage": stage,
@@ -129,7 +165,8 @@ async def run_agent(
                 "prompt. Preserve reviewer coverage, unresolved causes, evidence references, counterexamples, "
                 "and next steps in your notes. Checkpoint when useful; no read, batch, or output quota applies. "
                 "History retrieves the full journal or an agent-chosen turn_start:turn_end range, zero-based with "
-                "exclusive end. Set include_initial=true to reread the original initial evidence and supplied "
+                "exclusive end. char_start/char_end can read any serialized history reply in pieces; "
+                "turn_end=0 lists turn character sizes. Set include_initial=true to reread initial evidence and supplied "
                 "material. Earlier history retrievals appear in the journal as stable history_reference records; "
                 "issue the included request to resolve their original turn range. Original tool responses remain "
                 "recorded in full. Nothing is deleted by checkpointing, and all original evidence remains readable. "
@@ -145,8 +182,11 @@ async def run_agent(
                 "truncated), and partial. Each review has execution_id, phase, content. Select execution_ids "
                 "and/or span_ids to load only that evidence into Python; omitted selectors mean all. The full "
                 "selected content is available in data without being inserted into this conversation. "
-                "Print what you want to examine; stdout, stderr and exit_code are returned without truncation. "
-                "Each call starts fresh with the standard library and a temporary working directory. "
+                "Print what you want to examine; Python returns stdout, stderr and exit_code. Execution has "
+                "CPU, memory, elapsed-time, output and scratch-storage limits. An explicit error reports a "
+                "limit failure and captured output is marked incomplete. Choose smaller evidence scopes or "
+                "narrower printed results after a limit failure. Each call starts fresh with the standard "
+                "library and its own temporary scratch directory; networking and new processes are unavailable. "
                 "Python is a local analysis tool, not evidence by itself: cite exact original quotes. "
                 "Operate only on data and temporary files; no network or host filesystem inspection."
                 if enable_python
@@ -176,15 +216,28 @@ async def run_agent(
             ),
         ),
     )
+    just_compacted: bool = False  # rebind-ok: detect a replacement context that still cannot fit
     while True:
-        response, responded = await structured_response_with_history(
-            ModelRequest(purpose=purpose, prompt=prompt, messages=messages), response_schema, model, valid_turn
-        )
+        try:
+            response, responded = await structured_response_with_history(
+                ModelRequest(purpose=purpose, prompt=prompt, messages=messages), response_schema, call, valid_turn
+            )
+        except AnalysisContextExceeded as error:
+            if just_compacted:
+                raise AnalysisResponseError(
+                    "The compacted Lens task still exceeds the model's context window. "
+                    "Use a model with more context or shorten the investigation instructions."
+                ) from error
+            messages = await compact_context(error.request, call, len(journal) + 1, activity)
+            journal = (*journal, DialogueTurn(response=messages[1].content, tool_results=()))
+            just_compacted = True
+            continue
+        just_compacted = False
         if response.result is not None:
             return response.result
         completed_turn: DialogueTurn = DialogueTurn(
             response=responded[-1].content,
-            tool_results=tuple(await asyncio.gather(*(respond(request) for request in response.tools))),
+            tool_results=await parallel_tools(tuple(respond(request) for request in response.tools)),
         )
         archived_turn: DialogueTurn = completed_turn.model_copy(
             update=MappingProxyType(
@@ -197,21 +250,22 @@ async def run_agent(
             )
         )
         journal = (*journal, archived_turn)
-        continuation: tuple[ModelMessage, ...] = (
-            (
-                task_message,
-                ModelMessage(
-                    role="user", content=json.dumps({"working_notes": response.checkpoint}, ensure_ascii=False)
-                ),
-                responded[-1],
+        async with observe_operation(activity, "checkpoint" if response.checkpoint is not None else None):
+            continuation: tuple[ModelMessage, ...] = (
+                (
+                    task_message,
+                    ModelMessage(
+                        role="user", content=json.dumps({"working_notes": response.checkpoint}, ensure_ascii=False)
+                    ),
+                    responded[-1],
+                )
+                if response.checkpoint is not None
+                else responded
             )
-            if response.checkpoint is not None
-            else responded
-        )
-        messages = (
-            *continuation,
-            ModelMessage(
-                role="user",
-                content=json.dumps({"journal_turns": len(journal), "tool_results": completed_turn.tool_results}),
-            ),
-        )
+            messages = (
+                *continuation,
+                ModelMessage(
+                    role="user",
+                    content=json.dumps({"journal_turns": len(journal), "tool_results": completed_turn.tool_results}),
+                ),
+            )

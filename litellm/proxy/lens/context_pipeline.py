@@ -6,10 +6,12 @@ from typing import Final, Literal
 
 from pydantic import ValidationError
 
+from .activity import ActivityTracker, observe_operation, observed_model, track_activity
 from .agent_review import FINDINGS_TASK, Findings, review_context, validate_findings
 from .agent_runtime import run_agent
 from .agent_workspace import EvidenceWorkspace, ReviewRecord, load_workspace
 from .analysis import (
+    AnalysisContextExceeded,
     AnalysisResponseError,
     Candidate,
     Clusters,
@@ -72,8 +74,21 @@ async def parallel_cluster_batches(
             )
             for observation in observations
         )
-        merged, preserved = await merge_candidates(incoming, 0, model)
-        return index, (*preserved, *merged)
+        async with track_activity(
+            progress,
+            identity=f"group:{index}",
+            phase="group",
+            label=f"Compare observation batch {index + 1}",
+            execution_ids=tuple(
+                sorted(frozenset(chain.from_iterable(candidate.execution_ids for candidate in incoming)))
+            ),
+        ) as activity:
+            call: Final = observed_model(model, activity)
+            try:
+                merged, preserved = await merge_candidates(incoming, 0, call)
+            except AnalysisContextExceeded:
+                return index, await reconcile_registry(incoming, call)
+            return index, (*preserved, *merged)
 
     completed: Final = iter(range(1, len(batches) + 1))
     grouped: tuple[tuple[int, tuple[Candidate, ...]], ...] = ()  # rebind-ok: retain completed independent batches
@@ -87,13 +102,56 @@ async def parallel_cluster_batches(
     candidates: Final = tuple(chain.from_iterable(candidates for _, candidates in sorted(grouped)))
     if len(batches) < 2:
         return Clusters(candidates=candidates)
-    return await reconcile_candidates(candidates, model)
+    return await reconcile_candidates(candidates, model, progress)
 
 
-async def reconcile_candidates(candidates: tuple[Candidate, ...], model: ModelCall) -> Clusters:
+async def reconcile_candidates(
+    candidates: tuple[Candidate, ...], model: ModelCall, progress: ReportProgress | None = None
+) -> Clusters:
     ordered: Final = tuple(sorted(candidates, key=lambda candidate: (candidate.check_id, candidate.kind)))
-    merged, preserved = await merge_candidates(ordered, 0, model)
-    return Clusters(candidates=(*preserved, *merged))
+    async with track_activity(
+        progress,
+        identity="reconcile",
+        phase="reconcile",
+        label="Compare candidate patterns",
+        execution_ids=tuple(
+            sorted(frozenset(chain.from_iterable(candidate.execution_ids for candidate in candidates)))
+        ),
+    ) as activity:
+        call: Final = observed_model(model, activity)
+        try:
+            merged, preserved = await merge_candidates(ordered, 0, call)
+        except AnalysisContextExceeded:
+            return Clusters(candidates=await reconcile_registry(ordered, call))
+        return Clusters(candidates=(*preserved, *merged))
+
+
+async def reconcile_registry(candidates: tuple[Candidate, ...], model: ModelCall) -> tuple[Candidate, ...]:
+    registry: tuple[Candidate, ...] = ()  # rebind-ok: compare each incoming cause against all retained groups
+    for candidate in candidates:
+        if not registry:
+            registry = (candidate,)
+            continue
+        active, preserved = await merge_registry_page(registry, (candidate,), model)
+        registry = (*preserved, *active)
+    return registry
+
+
+async def merge_registry_page(
+    prior: tuple[Candidate, ...], active: tuple[Candidate, ...], model: ModelCall
+) -> tuple[tuple[Candidate, ...], tuple[Candidate, ...]]:
+    try:
+        return await merge_candidates((*prior, *active), len(prior), model)
+    except AnalysisContextExceeded as error:
+        if len(prior) <= 1:
+            raise AnalysisResponseError(
+                "The smallest candidate comparison exceeds the analysis model's context window. "
+                "Use a model with more context to compare these candidate patterns."
+            ) from error
+        midpoint: Final = len(prior) // 2
+        continued, earlier = await merge_registry_page(prior[:midpoint], active, model)
+        merged, later = await merge_registry_page(prior[midpoint:], continued, model)
+        return merged, (*earlier, *later)
 
 
 async def investigate_context_candidate(
@@ -103,6 +161,7 @@ async def investigate_context_candidate(
     model: ModelCall,
     *,
     access: Literal["full", "tools", "python"] = ACCESS,
+    activity: ActivityTracker | None = None,
 ) -> CandidateInvestigation:
     try:
         response: Final = await run_agent(
@@ -129,6 +188,7 @@ async def investigate_context_candidate(
             supplied=candidate.model_dump_json(),
             validate=lambda findings: validate_findings(claim, workspace, findings),
             enable_python=access == "python",
+            activity=activity,
         )
         return CandidateInvestigation(findings=response.findings)
     except (ValidationError, AnalysisResponseError) as error:
@@ -149,7 +209,17 @@ async def analyze_context(
     base: Final = Coverage(eligible=sample.eligible, selected=len(sample.executions))
     if not sample.executions:
         return Result(coverage=base)
-    workspace: Final = await load_workspace(sample, read, claim.job.settings.concurrency)
+    async with (
+        track_activity(
+            progress,
+            identity="load",
+            phase="load",
+            label="Load original trace workspace",
+            execution_ids=tuple(execution.id for execution in sample.executions),
+        ) as activity,
+        observe_operation(activity, "read"),
+    ):
+        workspace: Final = await load_workspace(sample, read, claim.job.settings.concurrency)
     slots: Final = asyncio.Semaphore(claim.job.settings.concurrency)
 
     async def limited(request: ModelRequest) -> ModelResult:
@@ -158,9 +228,22 @@ async def analyze_context(
 
     async def extract(claim: Claim, execution: Execution, _read: ReadContent, model: ModelCall) -> Examined:
         session: Final = next(session for session in workspace.sessions if session.execution.id == execution.id)
-        return await review_context(
-            claim, session, workspace, model, inject_evidence=access == "full", enable_python=access == "python"
-        )
+        async with track_activity(
+            progress,
+            identity=f"review:{execution.id}",
+            phase="review",
+            label=execution.service or execution.name,
+            execution_ids=(execution.id,),
+        ) as activity:
+            return await review_context(
+                claim,
+                session,
+                workspace,
+                model,
+                inject_evidence=access == "full",
+                enable_python=access == "python",
+                activity=activity,
+            )
 
     completed_reviews: Final = tuple(
         [review async for review in examine_executions(claim, sample, read, limited, progress, extractor=extract)]
@@ -192,7 +275,9 @@ async def analyze_context(
         ReviewRecord(
             execution_id=review.execution.id,
             phase="initial",
-            content=Extraction(observations=review.observations, cannot_assess=review.cannot_assess).model_dump_json(),
+            content=Extraction(
+                observations=review.observations, cannot_assess=review.cannot_assess, reasoning=review.reasoning
+            ).model_dump_json(),
         )
         for review in examined
     )
@@ -209,7 +294,16 @@ async def analyze_context(
 
     async def investigate(item: tuple[int, Candidate]) -> tuple[int, CandidateInvestigation]:
         index, candidate = item
-        return index, await investigate_context_candidate(claim, candidate, review_workspace, limited, access=access)
+        async with track_activity(
+            progress,
+            identity=f"investigate:{index}",
+            phase="investigate",
+            label=candidate.title,
+            execution_ids=candidate.execution_ids,
+        ) as activity:
+            return index, await investigate_context_candidate(
+                claim, candidate, review_workspace, limited, access=access, activity=activity
+            )
 
     await progress("Checking original evidence", investigating)
     completed: Final = iter(range(1, len(clusters.candidates) + 1))

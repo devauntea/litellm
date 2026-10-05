@@ -8,10 +8,11 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 import litellm
-from litellm.exceptions import ModelNotMappedError
+from litellm.exceptions import ContextWindowExceededError, ModelNotMappedError
 from litellm.integrations.clickhouse.context import lens_analysis
 from litellm.litellm_core_utils.initialize_dynamic_callback_params import inherit_message_logging_privacy
 from litellm.litellm_core_utils.token_counter import get_modified_max_tokens
+from litellm.proxy._types import ProxyException
 from litellm.proxy.lens.billing import complete, validate_key
 from litellm.proxy.lens.models import Job, Lens, ModelRequest, ModelResult, Step, Worker
 from litellm.proxy.lens.repository import LensRepository
@@ -32,6 +33,7 @@ class DeploymentParams(BaseModel):
 
 class ModelCapacity(BaseModel):
     model_config = ConfigDict(extra="ignore")
+    max_input_tokens: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
 
 
@@ -142,6 +144,30 @@ def cache_injection_points(body: ModelRequest) -> tuple[CacheControlMessageInjec
     )
 
 
+def exceeds_context(deployments: tuple[Deployment, ...], body: ModelRequest) -> bool:
+    return any(deployment_exceeds_context(deployment, body) for deployment in deployments)
+
+
+def deployment_exceeds_context(deployment: Deployment, body: ModelRequest) -> bool:
+    capacity: Final = (
+        deployment.model_info.max_input_tokens or catalog_capacity(deployment.litellm_params.model).max_input_tokens
+    )
+    return capacity is not None and prompt_tokens(deployment, body) >= capacity
+
+
+def prompt_tokens(deployment: Deployment, body: ModelRequest | str) -> int:
+    return litellm.token_counter(model=deployment.litellm_params.model, messages=list(request_messages(body)))
+
+
+def context_failure(error: ProxyException | ContextWindowExceededError) -> bool:
+    return (
+        isinstance(error, ContextWindowExceededError)
+        or isinstance(error.__context__, ContextWindowExceededError)
+        or isinstance(error.__cause__, ContextWindowExceededError)
+        or error.openai_code == "context_length_exceeded"
+    )
+
+
 def output_tokens(deployment: Deployment, prompt: ModelRequest | str | None = None) -> int:
     params: Final = deployment.litellm_params
     configured: Final = params.max_completion_tokens or params.max_tokens or deployment.model_info.max_output_tokens
@@ -199,13 +225,7 @@ def quote(deployments: tuple[Deployment, ...], prompt: ModelRequest | str) -> fl
         for p in prices
     )
     output: Final = min(output_tokens(d, prompt) for d in deployments)
-    input_tokens: Final = max(
-        litellm.token_counter(
-            model=d.litellm_params.model,
-            messages=list(request_messages(prompt)),
-        )
-        for d in deployments
-    )
+    input_tokens: Final = max(prompt_tokens(d, prompt) for d in deployments)
     return input_tokens * input_rate + output * output_rate
 
 
@@ -226,6 +246,8 @@ async def analyze(
     )
     if not deployments:
         raise HTTPException(400, "Analysis model is no longer available")
+    if exceeds_context(deployments, body):
+        return ModelResult(content="", cost=0, context_exceeded=True)
     estimate: Final = quote(deployments, body)
     now: Final = datetime.now(timezone.utc)
 
@@ -286,8 +308,13 @@ async def analyze(
         },
     }
 
-    with lens_analysis(), inherit_message_logging_privacy(True):
-        response, billed_cost = await complete(worker.analysis_key_id, data, reserve_budget, request)
+    try:
+        with lens_analysis(), inherit_message_logging_privacy(True):
+            response, billed_cost = await complete(worker.analysis_key_id, data, reserve_budget, request)
+    except (ProxyException, ContextWindowExceededError) as error:
+        if context_failure(error):
+            return ModelResult(content="", cost=0, context_exceeded=True)
+        raise
     cost: Final = billed_cost if billed_cost is not None else completion_charge(deployments, response, estimate)
 
     step: Final = model_step(response, body, job.settings.model, cost)

@@ -1,4 +1,5 @@
 import asyncio
+from itertools import chain
 from queue import SimpleQueue
 from types import MappingProxyType
 from typing import Final, Literal
@@ -9,22 +10,27 @@ from pydantic import BaseModel
 from litellm.proxy.lens.agent_review import Findings
 from litellm.proxy.lens.agent_runtime import AgentTurn
 from litellm.proxy.lens.agent_workspace import EvidenceReply, EvidenceRequest, EvidenceWorkspace, SessionContent
-from litellm.proxy.lens.analysis import Candidate, Clusters, Extraction, Observation
+from litellm.proxy.lens.analysis import AnalysisResponseError, Candidate, Clusters, Extraction, Observation
 from litellm.proxy.lens.context_pipeline import (
     investigate_context_candidate,
     parallel_cluster_batches,
     reconcile_candidates,
 )
 from litellm.proxy.lens.models import (
+    Activity,
     Claim,
     Coverage,
     Evidence,
     Execution,
     ExecutionContent,
     FindingDraft,
+    InFlight,
     ModelRequest,
     ModelResult,
+    Progress,
+    Review,
     Sample,
+    ToolCount,
     TracePart,
 )
 from litellm.proxy.lens.state import queue_job
@@ -42,7 +48,14 @@ class AssignedSession(BaseModel):
     execution: Execution
 
 
-async def ignore_progress(_stage: str, _coverage: Coverage) -> None:
+async def ignore_progress(
+    _stage: str | None,
+    _coverage: Coverage | None,
+    _review: Review | None = None,
+    _reading: tuple[InFlight, ...] | None = None,
+    _activity: Activity | None = None,
+    /,
+) -> None:
     return None
 
 
@@ -82,7 +95,83 @@ async def test_reconciliation_compares_large_candidate_set_once_without_losing_o
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_splits_only_after_overflow_and_preserves_cross_page_merges() -> None:
+    candidates: Final = tuple(
+        Candidate(check_id="retries", title=cause, hypothesis=cause, execution_ids=(f"run-{index}",))
+        for index, cause in enumerate(("cause-a", "cause-b", "cause-c", "cause-d", "cause-b", "cause-d"))
+    )
+    calls: Final = SimpleQueue[int]()
+    activities: Final = SimpleQueue[Activity]()
+
+    async def model(request: ModelRequest) -> ModelResult:
+        payload: Final = GroupPrompt.model_validate_json(request.prompt)
+        calls.put(len(payload.candidates))
+        if len(payload.candidates) > 3:
+            return ModelResult(content="", cost=0, context_exceeded=True)
+        causes: Final = tuple(dict.fromkeys(candidate.hypothesis for candidate in payload.candidates))
+        groups: Final = tuple(
+            tuple(candidate for candidate in payload.candidates if candidate.hypothesis == cause) for cause in causes
+        )
+        merged: Final = tuple(
+            group[0].model_copy(
+                update=MappingProxyType(
+                    {"execution_ids": tuple(chain.from_iterable(candidate.execution_ids for candidate in group))}
+                )
+            )
+            for group in groups
+            if len(group) > 1
+        )
+        return ModelResult(content=Clusters(candidates=merged).model_dump_json(), cost=0)
+
+    async def progress(
+        _stage: str | None,
+        _coverage: Coverage | None,
+        _review: Review | None = None,
+        _reading: tuple[InFlight, ...] | None = None,
+        activity: Activity | None = None,
+        /,
+    ) -> None:
+        if activity is not None:
+            activities.put(activity)
+
+    result: Final = await reconcile_candidates(candidates, model, progress)
+    assert {candidate.hypothesis: candidate.execution_ids for candidate in result.candidates} == {
+        "cause-a": ("run-0",),
+        "cause-b": ("run-1", "run-4"),
+        "cause-c": ("run-2",),
+        "cause-d": ("run-3", "run-5"),
+    }
+    assert len(result.candidates) == 4
+    assert calls.get_nowait() == len(candidates)
+    assert any(calls.get_nowait() > 3 for _ in range(calls.qsize()))
+    events: Final = tuple(activities.get_nowait() for _ in range(activities.qsize()))
+    assert frozenset(event.id for event in events) == frozenset(("reconcile",))
+    assert sum(event.finished for event in events) == 1
+    assert events[-1].finished
+    assert events[-1].operations == ()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_stops_when_two_candidates_cannot_fit() -> None:
+    calls: Final = SimpleQueue[ModelRequest]()
+
+    async def model(request: ModelRequest) -> ModelResult:
+        calls.put(request)
+        assert calls.qsize() <= 2
+        return ModelResult(content="", cost=0, context_exceeded=True)
+
+    candidates: Final = tuple(
+        Candidate(check_id="retries", title=f"Cause {index}", hypothesis="Large summary", execution_ids=(str(index),))
+        for index in range(2)
+    )
+    with pytest.raises(AnalysisResponseError, match="smallest candidate comparison exceeds"):
+        await reconcile_candidates(candidates, model)
+    assert 1 <= calls.qsize() <= 2
+
+
+@pytest.mark.asyncio
 async def test_production_entrypoint_makes_complete_child_content_available_without_eager_injection() -> None:
+    reports: Final = SimpleQueue[Progress]()
     run: Final = execution("real-session", 2)
     root: Final = TracePart(
         execution_id=run.id, span_id="root", name="coordinator", kind="agent", content="Task delivered"
@@ -116,13 +205,40 @@ async def test_production_entrypoint_makes_complete_child_content_available_with
             ToolReply.model_validate_json(request.messages[-1].content).tool_results[0]
         )
         assert reply.parts == (child.model_copy(update=MappingProxyType({"execution_id": "r0"})),)
-        return ModelResult(content=AgentTurn[Extraction](result=Extraction()).model_dump_json(), cost=0)
+        return ModelResult(
+            content=AgentTurn[Extraction](result=Extraction(reasoning="Recorded task completed.")).model_dump_json(),
+            cost=0,
+        )
+
+    async def progress(
+        stage: str | None,
+        coverage: Coverage | None,
+        review: Review | None = None,
+        reading: tuple[InFlight, ...] | None = None,
+        activity: Activity | None = None,
+        /,
+    ) -> None:
+        reports.put(Progress(stage=stage, coverage=coverage, review=review, reading=reading, activity=activity))
 
     claim: Final = Claim(lens_id="lens", job=queue_job(lens(), NOW, "job").jobs[0], findings=())
-    result: Final = await analyze_sample(claim, Sample(executions=(run,), eligible=1), read, model, ignore_progress)
+    result: Final = await analyze_sample(claim, Sample(executions=(run,), eligible=1), read, model, progress)
     assert result.coverage.screened == 1
     assert result.assessments[0].execution_id == run.id
     assert result.findings == ()
+    events: Final = tuple(reports.get_nowait() for _ in range(reports.qsize()))
+    reviews: Final = tuple(event.review for event in events if event.review is not None)
+    assert len(reviews) == 1
+    assert reviews[0].execution_id == run.id
+    assert reviews[0].reasoning == "Recorded task completed."
+    assert reviews[0].tool_calls == (ToolCount(name="read", calls=1),)
+    assert tuple((span.span_id, span.preview) for span in reviews[0].spans) == ((root.span_id, root.content),)
+    activities: Final = tuple(event.activity for event in events if event.activity is not None)
+    assert frozenset(activity.phase for activity in activities) == frozenset(("load", "review"))
+    assert all(activity.execution_ids == (run.id,) for activity in activities)
+    assert all(child.content not in activity.model_dump_json() for activity in activities)
+    assert tuple(activity.phase for activity in activities if activity.finished) == ("load", "review")
+    assert any(activity.phase == "review" and activity.operations == ("read",) for activity in activities)
+    assert any(event.reading and event.reading[0].execution_id == run.id for event in events)
 
 
 @pytest.mark.asyncio
@@ -139,6 +255,7 @@ async def test_grouping_overlaps_and_preserves_omitted_observations_in_input_ord
     both_entered: Final = asyncio.Event()
     second_finished: Final = asyncio.Event()
     progress_counts: Final = SimpleQueue[int]()
+    activities: Final = SimpleQueue[Activity]()
 
     async def model(request: ModelRequest) -> ModelResult:
         payload: Final = GroupPrompt.model_validate_json(request.prompt)
@@ -159,7 +276,18 @@ async def test_grouping_overlaps_and_preserves_omitted_observations_in_input_ord
             )
         return ModelResult(content=Clusters().model_dump_json(), cost=0)
 
-    async def progress(stage: str, coverage: Coverage) -> None:
+    async def progress(
+        stage: str | None,
+        coverage: Coverage | None,
+        _review: Review | None = None,
+        _reading: tuple[InFlight, ...] | None = None,
+        _activity: Activity | None = None,
+        /,
+    ) -> None:
+        if _activity is not None:
+            activities.put(_activity)
+        if coverage is None:
+            return
         assert stage == "Grouping observations"
         assert coverage.screened == 2
         progress_counts.put(coverage.grouped_batches)
@@ -185,10 +313,63 @@ async def test_grouping_overlaps_and_preserves_omitted_observations_in_input_ord
         )
     )
     assert tuple(progress_counts.get_nowait() for _ in range(progress_counts.qsize())) == (1, 2)
+    events: Final = tuple(activities.get_nowait() for _ in range(activities.qsize()))
+    assert frozenset(event.phase for event in events) == frozenset(("group", "reconcile"))
+    assert frozenset(event.id for event in events if event.finished) == frozenset(("group:0", "group:1", "reconcile"))
+
+
+@pytest.mark.asyncio
+async def test_initial_group_overflow_preserves_every_observation_and_execution_reference() -> None:
+    observations: Final = tuple(
+        Observation(
+            check_id="retries",
+            summary=f"Distinct cause {index}",
+            evidence=(Evidence(execution_id=f"run-{index}", span_id="span", quote="failure"),),
+        )
+        for index in range(5)
+    )
+    calls: Final = SimpleQueue[int]()
+    progress_counts: Final = SimpleQueue[int]()
+
+    async def model(request: ModelRequest) -> ModelResult:
+        payload: Final = GroupPrompt.model_validate_json(request.prompt)
+        calls.put(len(payload.candidates))
+        if len(payload.candidates) > 2:
+            return ModelResult(content="", cost=0, context_exceeded=True)
+        return ModelResult(content=Clusters().model_dump_json(), cost=0)
+
+    async def progress(
+        _stage: str | None,
+        coverage: Coverage | None,
+        _review: Review | None = None,
+        _reading: tuple[InFlight, ...] | None = None,
+        _activity: Activity | None = None,
+        /,
+    ) -> None:
+        if coverage is not None:
+            progress_counts.put(coverage.grouped_batches)
+
+    result: Final = await parallel_cluster_batches(
+        (observations,), model, progress, Coverage(screened=5, grouping_batches=1), concurrency=2
+    )
+    assert result == Clusters(
+        candidates=tuple(
+            Candidate(
+                check_id="retries",
+                title=observation.summary,
+                hypothesis=f"issue: {observation.summary}",
+                execution_ids=(observation.evidence[0].execution_id,),
+            )
+            for observation in observations
+        )
+    )
+    assert calls.get_nowait() == len(observations)
+    assert tuple(progress_counts.get_nowait() for _ in range(progress_counts.qsize())) == (1,)
 
 
 @pytest.mark.asyncio
 async def test_candidate_investigators_overlap_browse_reviews_and_keep_original_ids_in_order() -> None:
+    activities: Final = SimpleQueue[Activity]()
     runs: Final = tuple(
         execution(identity).model_copy(update=MappingProxyType({"root_seen": True}))
         for identity in ("first-session", "second-session")
@@ -276,13 +457,34 @@ async def test_candidate_investigators_overlap_browse_reviews_and_keep_original_
     configured: Final = initial.model_copy(
         update=MappingProxyType({"settings": initial.settings.model_copy(update=MappingProxyType({"concurrency": 2}))})
     )
+
+    async def progress(
+        _stage: str | None,
+        _coverage: Coverage | None,
+        _review: Review | None = None,
+        _reading: tuple[InFlight, ...] | None = None,
+        activity: Activity | None = None,
+        /,
+    ) -> None:
+        if activity is not None:
+            activities.put(activity)
+
     claim: Final = Claim(lens_id="lens", job=queue_job(configured, NOW, "job").jobs[0], findings=())
-    result: Final = await analyze_sample(claim, Sample(executions=runs, eligible=2), read, model, ignore_progress)
+    result: Final = await analyze_sample(claim, Sample(executions=runs, eligible=2), read, model, progress)
     assert tuple(finding.evidence[0].execution_id for finding in result.findings) == tuple(run.id for run in runs)
     assert tuple(assessment.execution_id for assessment in result.assessments) == tuple(run.id for run in runs)
     assert result.coverage == Coverage(
         eligible=2, selected=2, screened=2, investigated=2, grouping_batches=1, grouped_batches=1, candidates=2
     )
+    events: Final = tuple(activities.get_nowait() for _ in range(activities.qsize()))
+    final_checks: Final = tuple(event for event in events if event.phase == "investigate" and event.finished)
+    assert frozenset(event.execution_ids for event in final_checks) == frozenset((run.id,) for run in runs)
+    assert all(
+        frozenset(event.tool_calls)
+        == frozenset((ToolCount(name="read_reviews", calls=1), ToolCount(name="read", calls=1)))
+        for event in final_checks
+    )
+    assert all(event.operations == () for event in final_checks)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@ import json
 from itertools import chain
 from typing import Final
 
+from .activity import ActivityTracker
 from .agent_runtime import run_agent
 from .agent_workspace import EvidenceWorkspace, SessionContent
 from .analysis import Examined, Extraction, ModelCall
@@ -60,6 +61,7 @@ async def review_context(
     *,
     inject_evidence: bool = False,
     enable_python: bool = False,
+    activity: ActivityTracker | None = None,
 ) -> Examined:
     def validate(extraction: Extraction) -> str | None:
         for observation in extraction.observations:
@@ -89,6 +91,7 @@ async def review_context(
         ),
         validate=validate,
         enable_python=enable_python,
+        activity=activity,
     )
     citations: Final = tuple(chain.from_iterable(observation.evidence for observation in response.observations))
     cited: Final = tuple(
@@ -96,12 +99,17 @@ async def review_context(
         for part in workspace.parts
         if any(quote.execution_id == part.execution_id and quote.span_id == part.span_id for quote in citations)
     )
+    root: Final = next((part for part in session.parts if not part.parent_span_id), None)
+    assigned_cited: Final = tuple(part for part in cited if part.execution_id == session.execution.id)
     return Examined(
         execution=session.execution,
         observations=response.observations,
         parts=tuple(dict.fromkeys((*session.parts, *cited))),
         partial=session.partial,
         cannot_assess=response.cannot_assess or not session.parts,
+        reasoning=response.reasoning,
+        shown=tuple(dict.fromkeys((*((root,) if root is not None else ()), *assigned_cited))),
+        tool_calls=activity.activity.tool_calls if activity is not None else (),
     )
 
 

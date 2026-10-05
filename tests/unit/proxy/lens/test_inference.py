@@ -13,6 +13,8 @@ from litellm.proxy.lens.inference import (
     DeploymentParams,
     cache_injection_points,
     completion_charge,
+    context_failure,
+    exceeds_context,
     model_step,
     output_tokens,
     quote,
@@ -139,6 +141,49 @@ def test_unknown_model_capacity_requires_explicit_operator_metadata() -> None:
     assert "model_info.max_output_tokens" in error.value.detail
     configured: Final = Deployment(litellm_params=params, model_info=ModelCapacity(max_output_tokens=32000))
     assert output_tokens(configured) == 32000
+
+
+def test_context_preflight_uses_whole_conversation_and_smallest_deployment() -> None:
+    from litellm.proxy.lens.inference import ModelCapacity
+
+    params: Final = DeploymentParams(model="openai/lens-configured-context", max_tokens=400)
+    short: Final = ModelRequest(prompt="Review", purpose="extract")
+    long: Final = ModelRequest(
+        prompt="Review",
+        purpose="extract",
+        messages=(
+            ModelMessage(role="user", content="Review"),
+            ModelMessage(role="assistant", content="Read the original trace"),
+            ModelMessage(role="user", content="Original trace evidence. " * 600),
+        ),
+    )
+    small: Final = Deployment(litellm_params=params, model_info=ModelCapacity(max_input_tokens=1000))
+    large: Final = Deployment(litellm_params=params, model_info=ModelCapacity(max_input_tokens=10000))
+    assert not exceeds_context((small, large), short)
+    assert not exceeds_context((large,), long)
+    assert exceeds_context((large, small), long)
+    assert not exceeds_context((Deployment(litellm_params=params),), long)
+
+
+def test_provider_context_failure_recognizes_typed_overflow_without_reclassifying_other_errors() -> None:
+    from litellm.exceptions import ContextWindowExceededError
+    from litellm.proxy._types import ProxyException
+
+    overflow: Final = ContextWindowExceededError(
+        message="Provider input limit", model="analysis", llm_provider="openai"
+    )
+    wrapped: Final = ProxyException(message="redacted", type="invalid_request_error", param=None, code=400)
+    wrapped.__cause__ = overflow
+    coded: Final = ProxyException(
+        message="redacted", type="invalid_request_error", param=None, code=400, openai_code="context_length_exceeded"
+    )
+    unrelated: Final = ProxyException(
+        message="context_length_exceeded appears in user data", type="permission_error", param=None, code=403
+    )
+    assert context_failure(overflow)
+    assert context_failure(wrapped)
+    assert context_failure(coded)
+    assert not context_failure(unrelated)
 
 
 def test_a_model_step_records_the_serving_model_and_its_tokens() -> None:
