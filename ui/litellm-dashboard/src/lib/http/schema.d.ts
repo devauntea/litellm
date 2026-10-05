@@ -38405,6 +38405,16 @@ export interface components {
             /** Top Models */
             top_models: components["schemas"]["ModelInsightMetric"][];
         };
+        /** ModelMessage */
+        ModelMessage: {
+            /** Content */
+            content: string;
+            /**
+             * Role
+             * @enum {string}
+             */
+            role: "user" | "assistant";
+        };
         /** ModelParams */
         ModelParams: {
             /** Litellm Params */
@@ -38417,6 +38427,11 @@ export interface components {
         };
         /** ModelRequest */
         ModelRequest: {
+            /**
+             * Messages
+             * @default []
+             */
+            messages: components["schemas"]["ModelMessage"][];
             /** Prompt */
             prompt: string;
             /**

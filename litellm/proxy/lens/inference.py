@@ -16,6 +16,8 @@ from litellm.proxy.lens.billing import complete, validate_key
 from litellm.proxy.lens.models import Job, Lens, ModelRequest, ModelResult, Step, Worker
 from litellm.proxy.lens.repository import LensRepository
 from litellm.proxy.lens.state import add_step, current_job, renew_budget, replace_job
+from litellm.types.integrations.anthropic_cache_control_hook import CacheControlMessageInjectionPoint
+from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import CostPerToken, ModelResponse
 
 
@@ -71,12 +73,22 @@ class Prices(BaseModel):
     output_cost_per_token_above_200k_tokens: float = 0
     input_cost_per_token_above_128k_tokens: float = 0
     output_cost_per_token_above_128k_tokens: float = 0
+    input_cost_per_token_above_272k_tokens: float = 0
+    output_cost_per_token_above_272k_tokens: float = 0
+    cache_creation_input_token_cost: float = 0
+    cache_creation_input_token_cost_above_200k_tokens: float = 0
+    cache_creation_input_token_cost_above_272k_tokens: float = 0
 
     @field_validator(
         "input_cost_per_token_above_200k_tokens",
         "output_cost_per_token_above_200k_tokens",
         "input_cost_per_token_above_128k_tokens",
         "output_cost_per_token_above_128k_tokens",
+        "input_cost_per_token_above_272k_tokens",
+        "output_cost_per_token_above_272k_tokens",
+        "cache_creation_input_token_cost",
+        "cache_creation_input_token_cost_above_200k_tokens",
+        "cache_creation_input_token_cost_above_272k_tokens",
         mode="before",
     )
     @classmethod
@@ -107,7 +119,30 @@ def catalog_capacity(model: str) -> ModelCapacity:
         return ModelCapacity()
 
 
-def output_tokens(deployment: Deployment, prompt: str | None = None) -> int:
+def request_messages(body: ModelRequest | str) -> tuple[AllMessageValues, ...]:
+    if isinstance(body, str):
+        return ({"role": "system", "content": _SYSTEM}, {"role": "user", "content": body})
+    if not body.messages:
+        return request_messages(body.prompt)
+    conversation: Final[tuple[AllMessageValues, ...]] = tuple(
+        {"role": "user", "content": message.content}
+        if message.role == "user"
+        else {"role": "assistant", "content": message.content}
+        for message in body.messages
+    )
+    return ({"role": "system", "content": _SYSTEM}, *conversation)
+
+
+def cache_injection_points(body: ModelRequest) -> tuple[CacheControlMessageInjectionPoint, ...]:
+    user_indices: Final = tuple(index + 1 for index, message in enumerate(body.messages) if message.role == "user")
+    boundaries: Final = tuple(dict.fromkeys((*user_indices[:1], *user_indices[-2:])))
+    return tuple(
+        CacheControlMessageInjectionPoint(location="message", role=None, index=index, control=None)
+        for index in boundaries
+    )
+
+
+def output_tokens(deployment: Deployment, prompt: ModelRequest | str | None = None) -> int:
     params: Final = deployment.litellm_params
     configured: Final = params.max_completion_tokens or params.max_tokens or deployment.model_info.max_output_tokens
     capacity: Final = configured or catalog_capacity(params.model).max_output_tokens
@@ -122,7 +157,7 @@ def output_tokens(deployment: Deployment, prompt: str | None = None) -> int:
     adjusted: Final = get_modified_max_tokens(
         model=params.model,
         base_model=params.model,
-        messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": prompt}],
+        messages=list(request_messages(prompt)),
         user_max_tokens=capacity,
         buffer_perc=0,
         buffer_num=0,
@@ -130,10 +165,28 @@ def output_tokens(deployment: Deployment, prompt: str | None = None) -> int:
     return adjusted if adjusted is not None else capacity
 
 
-def quote(deployments: tuple[Deployment, ...], prompt: str) -> float:
+def quote(deployments: tuple[Deployment, ...], prompt: ModelRequest | str) -> float:
     prices: Final = tuple(deployment_prices(d) for d in deployments)
+    cache_rate: Final = (
+        max(
+            max(
+                p.cache_creation_input_token_cost,
+                p.cache_creation_input_token_cost_above_200k_tokens,
+                p.cache_creation_input_token_cost_above_272k_tokens,
+            )
+            for p in prices
+        )
+        if isinstance(prompt, ModelRequest) and prompt.messages
+        else 0
+    )
     input_rate: Final = max(
-        max(p.input_cost_per_token, p.input_cost_per_token_above_200k_tokens, p.input_cost_per_token_above_128k_tokens)
+        max(
+            p.input_cost_per_token,
+            p.input_cost_per_token_above_200k_tokens,
+            p.input_cost_per_token_above_128k_tokens,
+            p.input_cost_per_token_above_272k_tokens,
+            cache_rate,
+        )
         for p in prices
     )
     output_rate: Final = max(
@@ -141,6 +194,7 @@ def quote(deployments: tuple[Deployment, ...], prompt: str) -> float:
             p.output_cost_per_token,
             p.output_cost_per_token_above_200k_tokens,
             p.output_cost_per_token_above_128k_tokens,
+            p.output_cost_per_token_above_272k_tokens,
         )
         for p in prices
     )
@@ -148,7 +202,7 @@ def quote(deployments: tuple[Deployment, ...], prompt: str) -> float:
     input_tokens: Final = max(
         litellm.token_counter(
             model=d.litellm_params.model,
-            messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": prompt}],
+            messages=list(request_messages(prompt)),
         )
         for d in deployments
     )
@@ -172,7 +226,7 @@ async def analyze(
     )
     if not deployments:
         raise HTTPException(400, "Analysis model is no longer available")
-    estimate: Final = quote(deployments, body.prompt)
+    estimate: Final = quote(deployments, body)
     now: Final = datetime.now(timezone.utc)
 
     def reserve(e: Lens) -> Lens:
@@ -216,11 +270,9 @@ async def analyze(
 
     data: Final[dict[str, object]] = {  # mutable-ok: proxy processing enriches request data
         "model": job.settings.model,
-        "messages": [
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": body.prompt},
-        ],
-        "max_tokens": min(output_tokens(d, body.prompt) for d in deployments),
+        "messages": list(request_messages(body)),
+        **({"cache_control_injection_points": list(cache_injection_points(body))} if body.messages else {}),
+        "max_tokens": min(output_tokens(d, body) for d in deployments),
         "stream": False,
         "num_retries": 0,
         "disable_fallbacks": True,

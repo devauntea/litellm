@@ -316,9 +316,15 @@ class Result(Record):
     error: str = Field(default="")
 
 
+class ModelMessage(Record):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ModelRequest(Record):
     prompt: str = Field(min_length=1)
     purpose: Literal["extract", "cluster", "investigate"]
+    messages: tuple[ModelMessage, ...] = ()
 
 
 class ModelResult(Record):

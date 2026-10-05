@@ -1,14 +1,14 @@
-import json
 from typing import Final
 
 import pytest
 
 from litellm.proxy.lens.agent_review import review_context
 from litellm.proxy.lens.agent_runtime import AgentTurn
-from litellm.proxy.lens.agent_workspace import EvidenceRequest, EvidenceWorkspace, SessionContent
+from litellm.proxy.lens.agent_workspace import EvidenceReply, EvidenceRequest, EvidenceWorkspace, SessionContent
 from litellm.proxy.lens.analysis import Extraction, Observation
 from litellm.proxy.lens.models import Claim, Evidence, ModelRequest, ModelResult, TracePart
 from litellm.proxy.lens.state import queue_job
+from tests.unit.proxy.lens.test_agent_runtime import InitialPrompt, ToolReply
 from tests.unit.proxy.lens.test_agent_workspace import execution
 from tests.unit.proxy.lens.test_state import NOW, lens
 
@@ -40,10 +40,10 @@ async def test_context_review_reads_and_cites_original_evidence_with_optional_in
     turns: Final = iter((0, 1))
 
     async def model(request: ModelRequest) -> ModelResult:
-        payload: Final = json.loads(request.prompt)
+        payload: Final = InitialPrompt.model_validate_json(request.messages[1].content)
         if next(turns) == 0:
-            assert (part.content in request.prompt) is inject_evidence
-            assert payload["initial_evidence"] == ([part.model_dump(mode="json")] if inject_evidence else [])
+            assert any(part.content in message.content for message in request.messages) is inject_evidence
+            assert payload.initial_evidence == ((part,) if inject_evidence else ())
             return ModelResult(
                 content=AgentTurn[Extraction](
                     tools=(
@@ -56,7 +56,8 @@ async def test_context_review_reads_and_cites_original_evidence_with_optional_in
                 ).model_dump_json(),
                 cost=0,
             )
-        assert json.loads(payload["dialogue"][0]["tool_results"][0])["parts"] == [part.model_dump(mode="json")]
+        reply: Final = ToolReply.model_validate_json(request.messages[-1].content)
+        assert EvidenceReply.model_validate_json(reply.tool_results[0]).parts == (part,)
         return ModelResult(content=AgentTurn[Extraction](result=expected).model_dump_json(), cost=0)
 
     result: Final = await review_context(

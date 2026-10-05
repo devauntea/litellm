@@ -11,6 +11,7 @@ from litellm.proxy.lens.models import (
     Claim,
     Execution,
     ExecutionContent,
+    ModelMessage,
     ModelRequest,
     ModelResult,
     Result,
@@ -28,8 +29,18 @@ async def test_model_retries_transient_failures_but_not_budget_or_revocation(fai
     attempts: Final = SimpleQueue[str]()
     delays: Final = SimpleQueue[float]()
     expected: Final = ModelResult(content='{"observations":[]}', cost=0.01)
+    body: Final = ModelRequest(
+        purpose="extract",
+        prompt="review",
+        messages=(
+            ModelMessage(role="user", content="review"),
+            ModelMessage(role="assistant", content='{ "tools": [{"action": "read"}] }'),
+            ModelMessage(role="user", content="Full original evidence"),
+        ),
+    )
 
     def handle(request: httpx.Request) -> httpx.Response:
+        assert ModelRequest.model_validate_json(request.content) == body
         attempts.put(request.url.path)
         if attempts.qsize() == 1:
             if failure == "timeout":
@@ -45,10 +56,10 @@ async def test_model_retries_transient_failures_but_not_budget_or_revocation(fai
         worker: Final = LensWorker(client, analysis=analyze_sample, sleep=sleep)
         if failure in (402, 409, 401):
             with pytest.raises(httpx.HTTPStatusError):
-                await worker.model_request("/model", ModelRequest(purpose="extract", prompt="review"))
+                await worker.model_request("/model", body)
             assert attempts.qsize() == 1 and delays.empty()
         else:
-            assert await worker.model_request("/model", ModelRequest(purpose="extract", prompt="review")) == expected
+            assert await worker.model_request("/model", body) == expected
             assert attempts.qsize() == 2
             assert delays.get_nowait() == 1 and delays.empty()
 

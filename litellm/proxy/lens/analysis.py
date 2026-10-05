@@ -16,6 +16,7 @@ from .models import (
     Execution,
     ExecutionContent,
     FindingDraft,
+    ModelMessage,
     ModelRequest,
     ModelResult,
     Record,
@@ -128,6 +129,16 @@ async def structured_response(
     model: ModelCall,
     validate: Callable[[ResponseT], str | None] = lambda _: None,
 ) -> ResponseT:
+    parsed, _ = await structured_response_with_history(request, schema, model, validate)
+    return parsed
+
+
+async def structured_response_with_history(
+    request: ModelRequest,
+    schema: type[ResponseT],
+    model: ModelCall,
+    validate: Callable[[ResponseT], str | None] = lambda _: None,
+) -> tuple[ResponseT, tuple[ModelMessage, ...]]:
     response: Final = await model(request)
     try:
         parsed: Final = schema.model_validate_json(response.content)
@@ -136,18 +147,26 @@ async def structured_response(
         invalid: Final = validate(parsed)
         if invalid:
             raise ValueError(invalid)
-        return parsed
+        return parsed, (*request.messages, ModelMessage(role="assistant", content=response.content))
     except ValueError as error:
         problem: Final = (
             error.json(include_input=False, include_url=False) if isinstance(error, ValidationError) else str(error)
         )
+    correction: Final = (
+        "\nYour previous response did not match the required response contract. Generate a new response "
+        "from the original evidence, correcting these validation errors: " + problem
+    )
     repair: Final = request.model_copy(
         update=MappingProxyType(
             {
-                "prompt": request.prompt
-                + "\nYour previous response did not match the required response contract. Generate a new response "
-                "from the original evidence, correcting these validation errors: " + problem
+                "messages": (
+                    *request.messages,
+                    ModelMessage(role="assistant", content=response.content),
+                    ModelMessage(role="user", content=correction),
+                )
             }
+            if request.messages
+            else {"prompt": request.prompt + correction}
         )
     )
     repaired: Final = await model(repair)
@@ -158,7 +177,7 @@ async def structured_response(
         remaining: Final = validate(corrected)
         if remaining:
             raise ValueError(remaining)
-        return corrected
+        return corrected, (*repair.messages, ModelMessage(role="assistant", content=repaired.content))
     except ValueError as error:
         stage: Final = MappingProxyType(
             {

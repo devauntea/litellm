@@ -13,13 +13,14 @@ from litellm.proxy.lens.models import (
     Evidence,
     Execution,
     ExecutionContent,
+    ModelMessage,
     ModelRequest,
     ModelResult,
     Sample,
     TracePart,
 )
 from litellm.proxy.lens.state import queue_job
-from tests.unit.proxy.lens.test_state import NOW, issue_brief, lens, finding
+from tests.unit.proxy.lens.test_state import NOW, finding, issue_brief, lens
 
 
 @pytest.mark.asyncio
@@ -443,6 +444,38 @@ async def test_invalid_model_output_has_only_one_repair_attempt() -> None:
         AnalysisResponseError, match="Reading executions failed: Extraction response invalid after 2 attempts"
     ):
         await structured_response(ModelRequest(purpose="extract", prompt="Extract observations"), Extraction, model)
+    assert next(attempts, None) is None
+
+
+@pytest.mark.asyncio
+async def test_conversation_repair_appends_raw_response_and_correction_without_changing_the_prefix() -> None:
+    from litellm.proxy.lens.analysis import Extraction, structured_response_with_history
+
+    original: Final = ModelRequest(
+        purpose="extract",
+        prompt="Stable task",
+        messages=(ModelMessage(role="user", content="Stable task"), ModelMessage(role="user", content="Evidence")),
+    )
+    malformed: Final = '{ "observations": "wrong type" }'
+    corrected: Final = '{ "observations": [], "cannot_assess": false }'
+    attempts: Final = iter((0, 1))
+    repairs: Final = SimpleQueue[ModelRequest]()
+
+    async def model(request: ModelRequest) -> ModelResult:
+        if next(attempts) == 0:
+            assert request == original
+            return ModelResult(content=malformed, cost=0)
+        assert request.prompt == original.prompt
+        assert request.messages[:-2] == original.messages
+        assert request.messages[-2] == ModelMessage(role="assistant", content=malformed)
+        assert request.messages[-1].role == "user"
+        assert "observations" in request.messages[-1].content
+        repairs.put(request)
+        return ModelResult(content=corrected, cost=0)
+
+    result, history = await structured_response_with_history(original, Extraction, model)
+    assert result == Extraction()
+    assert history == (*repairs.get_nowait().messages, ModelMessage(role="assistant", content=corrected))
     assert next(attempts, None) is None
 
 
